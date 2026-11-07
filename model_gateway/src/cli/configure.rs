@@ -1231,6 +1231,7 @@ impl CliArgs {
             .pd_pairing_mode(
                 PdPairingMode::parse(&self.routing.pd_pairing_mode).unwrap_or_default(),
             )
+            .grouped_dp_sticky(self.routing.grouped_dp_sticky)
             .routing_key_override(RoutingKeyOverrideConfig {
                 enabled: self.routing.routing_key_override,
                 eviction_interval_secs: self.routing.eviction_interval,
