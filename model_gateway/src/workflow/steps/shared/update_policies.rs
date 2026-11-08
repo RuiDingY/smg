@@ -9,9 +9,56 @@ use wfaas::{
 };
 
 use crate::{
+    app_context::AppContext,
     worker::{ConnectionMode, SubscriptionKind, Worker},
     workflow::data::WorkerRegistrationData,
 };
+
+/// Start the worker's stream on the KV event monitor, or restart it for the
+/// object given when the registry replaced the worker in place. The stream
+/// follows the policy that places the worker, the role's policy for a
+/// prefill, decode or encode worker rather than the model's: its KV events
+/// into the model's index under a policy that reads the index
+/// (`needs_kv_events`), its load records alone otherwise, when the worker
+/// monitor wants loads at all (always by default; see
+/// `WorkerMonitor::loads_wanted`). Only gRPC workers stream. A registration
+/// and an update that rebuilt the worker both come through here, so the two
+/// cannot choose differently. The monitor reads the registry through the
+/// `still_held` closure while it holds its slot lock, so a worker removed or
+/// replaced again while the add waited for an old task to end gets no stream.
+pub(crate) async fn start_kv_stream(
+    app_context: &AppContext,
+    worker: &Arc<dyn Worker>,
+    needs_kv_events: bool,
+) {
+    if *worker.connection_mode() != ConnectionMode::Grpc {
+        return;
+    }
+    let Some(monitor) = app_context.kv_event_monitor.as_ref() else {
+        return;
+    };
+    let kind = if needs_kv_events {
+        Some(SubscriptionKind::Events)
+    } else {
+        app_context
+            .worker_monitor
+            .as_ref()
+            .is_some_and(|loads| loads.loads_wanted(std::slice::from_ref(worker)))
+            .then_some(SubscriptionKind::Loads)
+    };
+    if let Some(kind) = kind {
+        // The registry's object for the URL, by address (the vtable is no
+        // part of the identity); read by the monitor before it stops or
+        // starts anything.
+        let still_held = || {
+            app_context
+                .worker_registry
+                .get_by_url(worker.url())
+                .is_some_and(|held| std::ptr::addr_eq(Arc::as_ptr(&held), Arc::as_ptr(worker)))
+        };
+        monitor.on_worker_added(worker, kind, still_held).await;
+    }
+}
 
 /// Unified step to update policy registry for registered workers.
 ///
@@ -152,32 +199,13 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
                 .policy_registry
                 .init_cache_aware_policy(&model_id, &all_workers);
 
-            // The worker's stream follows the policy that places it, the
-            // role's policy for a prefill, decode or encode worker rather than
-            // the model's: its KV events into the model's index under a policy
-            // that reads the index, its load records alone otherwise, when
-            // the worker monitor wants loads at all (always by default; see
-            // `WorkerMonitor::loads_wanted`). Only gRPC workers stream.
+            // The worker's stream, by the policy that places it (see
+            // `start_kv_stream`).
             let needs_kv_events = app_context
                 .policy_registry
                 .policy_for_worker(worker.as_ref())
                 .needs_kv_events();
-            if *worker.connection_mode() == ConnectionMode::Grpc {
-                if let Some(ref monitor) = app_context.kv_event_monitor {
-                    let kind = if needs_kv_events {
-                        Some(SubscriptionKind::Events)
-                    } else {
-                        app_context
-                            .worker_monitor
-                            .as_ref()
-                            .is_some_and(|loads| loads.loads_wanted(std::slice::from_ref(worker)))
-                            .then_some(SubscriptionKind::Loads)
-                    };
-                    if let Some(kind) = kind {
-                        monitor.on_worker_added(worker, kind).await;
-                    }
-                }
-            }
+            start_kv_stream(&app_context, worker, needs_kv_events).await;
 
             Self::warn_on_cache_aware_without_kv_events(&model_id, worker, needs_kv_events);
 

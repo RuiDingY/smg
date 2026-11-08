@@ -1367,7 +1367,7 @@ mod tests {
         let worker = grpc_worker(addr);
         let monitor = KvEventMonitor::new();
         monitor
-            .on_worker_added(&worker, SubscriptionKind::Loads)
+            .on_worker_added(&worker, SubscriptionKind::Loads, || true)
             .await;
         let deadline = Instant::now() + Duration::from_secs(5);
         let request = loop {
@@ -1581,7 +1581,7 @@ mod tests {
         let worker = grpc_worker(addr);
         let monitor = KvEventMonitor::new();
         monitor
-            .on_worker_added(&worker, SubscriptionKind::Events)
+            .on_worker_added(&worker, SubscriptionKind::Events, || true)
             .await;
         // Let the task connect and park in the subscribe call.
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1623,7 +1623,7 @@ mod tests {
         let worker = grpc_worker(addr);
         let monitor = KvEventMonitor::new();
         monitor
-            .on_worker_added(&worker, SubscriptionKind::Events)
+            .on_worker_added(&worker, SubscriptionKind::Events, || true)
             .await;
         let deadline = Instant::now() + Duration::from_secs(5);
         let request = loop {
@@ -1671,7 +1671,7 @@ mod tests {
                 let worker = grpc_worker(addr);
                 let monitor = KvEventMonitor::new();
                 monitor
-                    .on_worker_added(&worker, SubscriptionKind::Events)
+                    .on_worker_added(&worker, SubscriptionKind::Events, || true)
                     .await;
                 tokio::time::sleep(Duration::from_millis(1_900)).await;
                 monitor.on_worker_removed(worker.url()).await;
@@ -1748,7 +1748,7 @@ mod tests {
                 let worker = grpc_worker(addr);
                 let monitor = KvEventMonitor::new();
                 monitor
-                    .on_worker_added(&worker, SubscriptionKind::Events)
+                    .on_worker_added(&worker, SubscriptionKind::Events, || true)
                     .await;
                 for _ in 0..500 {
                     if gauge(&handle, worker.url()) == Some(1.0) {

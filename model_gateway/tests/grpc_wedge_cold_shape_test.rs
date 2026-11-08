@@ -278,7 +278,7 @@ async fn build_bed(port: u16) -> Bed {
         .register(Arc::clone(&worker))
         .expect("register the worker");
     kv_monitor
-        .on_worker_added(&worker, SubscriptionKind::Events)
+        .on_worker_added(&worker, SubscriptionKind::Events, || true)
         .await;
     let router = RouterFactory::create_router(&app_context)
         .await

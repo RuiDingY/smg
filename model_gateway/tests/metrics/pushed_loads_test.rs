@@ -91,7 +91,7 @@ async fn eight_workers_loads_reach_the_gateway_through_the_event_streams() {
             .register(Arc::clone(&worker))
             .unwrap();
         kv_monitor
-            .on_worker_added(&worker, SubscriptionKind::Events)
+            .on_worker_added(&worker, SubscriptionKind::Events, || true)
             .await;
         urls.push(url);
     }
