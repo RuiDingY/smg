@@ -67,7 +67,7 @@ impl ActiveReservation {
 }
 
 /// What the in-memory backend's `replace_policy` did to the live buckets.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct PolicyReplacement {
     /// Buckets whose scope kept its limits, kept with their fill.
     pub kept: usize,
