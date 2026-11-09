@@ -2348,10 +2348,10 @@ impl StreamingProcessor {
                     if let Err(failure) = result {
                         span.in_scope(|| source.account(&failure));
                         let error_event = MessageStreamEvent::Error {
-                            error: messages::ErrorResponse {
-                                error_type: failure.messages_error_type().to_string(),
-                                message: failure.to_string(),
-                            },
+                            error: messages::ErrorResponse::new(
+                                failure.messages_error_type(),
+                                failure.to_string(),
+                            ),
                         };
                         let mut buf = BytesMut::with_capacity(MESSAGES_EVENT_ROOM);
                         let _ = Self::send_messages_event(&tx, &mut buf, &error_event).await;
@@ -2395,10 +2395,10 @@ impl StreamingProcessor {
                         let failure = explained.as_ref().unwrap_or(&failure);
                         span.in_scope(|| source.account(failure));
                         let error_event = MessageStreamEvent::Error {
-                            error: messages::ErrorResponse {
-                                error_type: failure.messages_error_type().to_string(),
-                                message: failure.to_string(),
-                            },
+                            error: messages::ErrorResponse::new(
+                                failure.messages_error_type(),
+                                failure.to_string(),
+                            ),
                         };
                         let mut buf = BytesMut::with_capacity(MESSAGES_EVENT_ROOM);
                         let _ = Self::send_messages_event(&tx, &mut buf, &error_event).await;
@@ -2407,10 +2407,10 @@ impl StreamingProcessor {
             }
             context::ExecutionResult::Embedding { .. } => Box::pin(async move {
                 let error_event = MessageStreamEvent::Error {
-                    error: messages::ErrorResponse {
-                        error_type: "invalid_request_error".to_string(),
-                        message: "Embeddings not supported for Messages API".to_string(),
-                    },
+                    error: messages::ErrorResponse::new(
+                        "invalid_request_error",
+                        "Embeddings not supported for Messages API",
+                    ),
                 };
                 let mut buf = BytesMut::with_capacity(MESSAGES_EVENT_ROOM);
                 let _ = Self::send_messages_event(&tx, &mut buf, &error_event).await;
@@ -2418,10 +2418,10 @@ impl StreamingProcessor {
             // Batch results exist only on the completions pipeline.
             context::ExecutionResult::Batch { .. } => Box::pin(async move {
                 let error_event = MessageStreamEvent::Error {
-                    error: messages::ErrorResponse {
-                        error_type: "invalid_request_error".to_string(),
-                        message: "Batched results not supported for Messages API".to_string(),
-                    },
+                    error: messages::ErrorResponse::new(
+                        "invalid_request_error",
+                        "Batched results not supported for Messages API",
+                    ),
                 };
                 let mut buf = BytesMut::with_capacity(MESSAGES_EVENT_ROOM);
                 let _ = Self::send_messages_event(&tx, &mut buf, &error_event).await;
