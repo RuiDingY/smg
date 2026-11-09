@@ -13,14 +13,15 @@
 //! unchanged: a turn is a [`StoredResponse`] whose `input` holds the turn's
 //! request fields ([`TurnInput`]) and whose `raw_response` holds the answer,
 //! chained by `previous_response_id`, so a thread holds its conversation
-//! once, not once per turn. The store keeps the newest [`MAX_TURNS`] turns
-//! for [`TURN_RETENTION_SECS`] after they were written, the oldest evicted
-//! first, on every write; a thread is read back whole up to that count. A
-//! turn is written under its answer's id. An id that is already a stored
-//! turn's (a repeated `rid`, a backend's repeated id, a guess) would hand
-//! the client an id that continues another conversation, so the answer is
-//! reissued under a fresh id, in the answer the client reads and in the
-//! store.
+//! once, not once per turn. The store keeps the turns the operator's
+//! `memory` bounds allow, the `max_responses` and `retention_secs` of the
+//! memory history backend (unset: 10,000 turns, each for a day after it was
+//! written), the oldest evicted first, on every write; a thread is read
+//! back whole up to that count. A turn is written under its answer's id.
+//! An id that is already a stored turn's (a repeated `rid`, a backend's
+//! repeated id, a guess) would hand the client an id that continues another
+//! conversation, so the answer is reissued under a fresh id, in the answer
+//! the client reads and in the store.
 //!
 //! Best effort, as the public API's threads are: a turn that was not stored
 //! (a streamed answer, an error, an answer the gateway could not read, a
@@ -56,14 +57,6 @@ use tracing::{debug, warn};
 use crate::{
     middleware::messages_error_type, observability::metrics::Metrics, routers::error as route_error,
 };
-
-/// The turns the store keeps: the newest 10,000, each for an hour after it
-/// was written (the public API deletes a thread no more than an hour after
-/// its last use). Over the count the oldest go first; both bounds are
-/// applied on every write. The count is also the depth a thread is read
-/// back to, so no kept thread is cut short of its create turn.
-const MAX_TURNS: usize = 10_000;
-const TURN_RETENTION_SECS: u64 = 60 * 60;
 
 /// An answer over this cannot be read back for its record: the Messages
 /// route's own answers are far smaller.
@@ -261,20 +254,20 @@ pub(crate) struct MessageThreads {
 }
 
 impl MessageThreads {
+    /// The threads under the default bounds ([`MemoryConfig::default`]).
     pub(crate) fn new() -> Self {
-        Self::bounded(MAX_TURNS)
+        Self::from_config(&MemoryConfig::default())
     }
 
-    /// The threads in a store of `max_turns` turns, each kept for the
-    /// retention period.
-    fn bounded(max_turns: usize) -> Self {
+    /// The threads in a store bounded as the operator's `memory` section
+    /// says: at most `max_responses` turns, each kept for `retention_secs`
+    /// after it was written, the oldest evicted first on every write. The
+    /// count is also the depth a thread is read back to, so no kept thread
+    /// is cut short of its create turn.
+    pub(crate) fn from_config(config: &MemoryConfig) -> Self {
         Self {
-            store: MemoryResponseStorage::with_config(&MemoryConfig {
-                max_responses: max_turns,
-                retention_secs: Some(TURN_RETENTION_SECS),
-                ..MemoryConfig::default()
-            }),
-            max_turns,
+            store: MemoryResponseStorage::with_config(config),
+            max_turns: config.max_responses,
         }
     }
 
@@ -488,6 +481,7 @@ mod tests {
     use std::time::Duration;
 
     use axum::{body::Bytes, http::header, response::IntoResponse, Json};
+    use chrono::Utc;
     use futures::{stream, StreamExt};
     use tokio::time::timeout;
 
@@ -864,7 +858,14 @@ mod tests {
     /// store itself let the turn go, not only the walk's depth.
     #[tokio::test]
     async fn an_evicted_create_turn_ends_the_thread() {
-        let threads = MessageThreads::bounded(2);
+        let threads = MessageThreads::from_config(&MemoryConfig {
+            max_responses: 2,
+            ..MemoryConfig::default()
+        });
+        assert_eq!(
+            threads.max_turns, 2,
+            "the chain is read back to the configured count, not the default"
+        );
         let last = thread(&threads, None, 3, "bounded").await;
         assert!(
             threads
@@ -1006,6 +1007,82 @@ mod tests {
             })
             .collect();
         assert_eq!(texts, ["m1", "a1", "m2", "a2", "m3"]);
+    }
+
+    /// A turn older than the operator's retention is gone when the store
+    /// next evicts: the thread ends with the public 404 and the client
+    /// replays.
+    #[tokio::test]
+    async fn a_turn_past_the_retention_ends_the_thread() {
+        let threads = MessageThreads::from_config(&MemoryConfig {
+            retention_secs: Some(60),
+            ..MemoryConfig::default()
+        });
+        let last = thread(&threads, None, 2, "aged").await;
+        let cont = || {
+            request(json!({
+                "messages": [{"role": "user", "content": "turn 3"}],
+                "thread": {"type": "continue", "previous_message_id": last}
+            }))
+        };
+        accepted(threads.resolve(cont(), None).await);
+        threads
+            .store
+            .evict_at(Utc::now() + chrono::Duration::seconds(61));
+        let refused = refusal(threads.resolve(cont(), None).await);
+        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A relayed answer carries its upstream's Content-Length. Reissued under
+    /// a fresh id its body is new bytes, so the stale length is dropped and
+    /// the server frames the body it sends.
+    #[tokio::test]
+    async fn a_reissued_answer_drops_the_stale_content_length() {
+        let threads = MessageThreads::new();
+        let relayed = || {
+            let body = serde_json::to_vec(&json!({
+                "id": "R", "type": "message", "role": "assistant", "model": "m",
+                "content": [{"type": "text", "text": "a"}], "stop_reason": "end_turn",
+                "stop_sequence": null, "usage": {"input_tokens": 3, "output_tokens": 2}
+            }))
+            .expect("json");
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::CONTENT_LENGTH, body.len())
+                .body(Body::from(body))
+                .expect("a response")
+        };
+        let create = || {
+            request(json!({
+                "messages": [{"role": "user", "content": "hi"}],
+                "thread": {"type": "create"}
+            }))
+        };
+        let (_, first) = accepted(threads.resolve(create(), None).await);
+        let kept = threads.stored(first.expect("a turn"), relayed()).await;
+        assert_eq!(body_of(kept).await["id"], "R");
+        let (_, second) = accepted(threads.resolve(create(), None).await);
+        let reissued = threads.stored(second.expect("a turn"), relayed()).await;
+        let declared = reissued.headers().get(header::CONTENT_LENGTH).map(|value| {
+            value
+                .to_str()
+                .expect("ascii")
+                .parse::<usize>()
+                .expect("a length")
+        });
+        let bytes = to_bytes(reissued.into_body(), usize::MAX)
+            .await
+            .expect("a body");
+        assert_ne!(
+            serde_json::from_slice::<Value>(&bytes).expect("json")["id"],
+            "R"
+        );
+        assert!(
+            declared.is_none_or(|length| length == bytes.len()),
+            "a stale Content-Length ({declared:?}) on a body of {} bytes",
+            bytes.len()
+        );
     }
 
     /// A thread longer than the history store's default chain depth of 100
