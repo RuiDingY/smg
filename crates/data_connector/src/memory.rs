@@ -724,6 +724,7 @@ impl InnerStore {
 /// still running (`queued` or `in_progress`) is not dropped by the count
 /// bound, so its client finds it when it polls; the retention drops it like
 /// any record.
+#[derive(Clone)]
 pub struct MemoryResponseStorage {
     /// Single lock wrapping the maps to prevent deadlocks and ensure atomic updates
     store: Arc<RwLock<InnerStore>>,
@@ -748,6 +749,23 @@ impl MemoryResponseStorage {
     /// `now`; answers how many went. Every write does this at the current time.
     pub fn evict_at(&self, now: DateTime<Utc>) -> usize {
         self.store.write().evict(&self.bounds, now)
+    }
+
+    /// The record written under its id, in place of what was there (a
+    /// record replaced under its id keeps its one index entry); every write
+    /// drops what is over the bounds at this time. The store trait's
+    /// `store_response` and the streamed thread turn's final write.
+    pub fn replace_response(&self, response: StoredResponse) -> ResponseId {
+        let now = Utc::now();
+        let mut store = self.store.write();
+        let response_id = store.insert(response, now);
+        store.evict(&self.bounds, now);
+        response_id
+    }
+
+    /// The record under `response_id` removed, when there is one.
+    pub fn remove_response(&self, response_id: &ResponseId) {
+        self.store.write().remove(response_id);
     }
 
     /// Puts `response` under its id when nothing is stored under it; a
@@ -847,14 +865,7 @@ impl ResponseStorage for MemoryResponseStorage {
             response.id = ResponseId::new();
         }
 
-        // Single lock acquisition for atomic update; a record replaced
-        // under its id keeps its one index entry. Every write drops what is
-        // over the bounds at this time.
-        let now = Utc::now();
-        let mut store = self.store.write();
-        let response_id = store.insert(response, now);
-        store.evict(&self.bounds, now);
-        Ok(response_id)
+        Ok(self.replace_response(response))
     }
 
     async fn store_response_if_open(
@@ -914,7 +925,7 @@ impl ResponseStorage for MemoryResponseStorage {
     }
 
     async fn delete_response(&self, response_id: &ResponseId) -> ResponseResult<()> {
-        self.store.write().remove(response_id);
+        self.remove_response(response_id);
         Ok(())
     }
 
