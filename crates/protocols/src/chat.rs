@@ -367,6 +367,13 @@ pub struct ChatCompletionRequest {
     #[validate(custom(function = "validate_stop"))]
     pub stop: Option<StringOrArray>,
 
+    /// The contract's `store`: a stored completion. Only the OpenAI profile
+    /// passes `true` through, to the hosted provider that keeps it; every
+    /// other profile refuses it by name (`unsupported_parameter`), as no
+    /// serving engine keeps completions. `false`, the contract's default,
+    /// passes everywhere.
+    pub store: Option<bool>,
+
     /// If set, partial message deltas will be sent
     #[serde(default, deserialize_with = "deserialize_null_as_false")]
     pub stream: bool,
@@ -398,6 +405,12 @@ pub struct ChatCompletionRequest {
     /// How verbose the answer should be: `low`, `medium` or `high`
     #[validate(custom(function = "validate_verbosity"))]
     pub verbosity: Option<String>,
+
+    /// The contract's hosted web search options. Only the OpenAI profile
+    /// passes them through, to the provider whose search models run them;
+    /// every other profile refuses them by name (`unsupported_parameter`)
+    /// instead of answering as if it had searched.
+    pub web_search_options: Option<Value>,
 
     // =============================================================================
     // Engine-Specific Sampling Parameters
@@ -823,10 +836,11 @@ fn validate_chat_cross_parameters(
     //     token limits at once are judged there: the request keeps whichever
     //     the client wrote and `output_token_cap` reads `max_completion_tokens`
     //     first, the precedence the serving engines apply themselves; only
-    //     OpenAI's own contract refuses the pair.
-    ProviderProfile::for_model(&req.model).validate_chat(req)?;
-
-    Ok(())
+    //     OpenAI's own contract refuses the pair. The contract's hosted
+    //     features (a web search, a stored completion) are judged by the
+    //     gateway's chat extractor instead, which knows whether an external
+    //     worker serves the model (`ProviderProfile::validate_hosted_features`).
+    ProviderProfile::for_model(&req.model).validate_chat(req)
 }
 
 /// A `tool_choice` against the tools the model will see: the request's tools
@@ -1990,6 +2004,7 @@ mod request_contract_tests {
     use validator::Validate;
 
     use super::{ChatCompletionRequest, ChatMessage};
+    use crate::profile::ProviderProfile;
 
     fn request(extra: Value) -> ChatCompletionRequest {
         let mut value = json!({
@@ -2143,6 +2158,125 @@ mod request_contract_tests {
         let legacy = request(json!({"max_tokens": 32, "max_completion_tokens": null}));
         assert_eq!(rejection(&legacy), None);
         assert_eq!(legacy.output_token_cap(), Some(32));
+    }
+
+    /// The contract's hosted web search and stored completions run on no
+    /// serving engine: a request that asks for them is refused by name, where
+    /// the passthrough map used to drop them. The gateway's chat extractor
+    /// judges that with the fleet in view (`validate_hosted_features`, the
+    /// engine case here); the shared validation keeps the typed fields, and
+    /// the OpenAI profile or a request served externally keeps them.
+    /// `store: false` is the default and passes.
+    #[test]
+    fn web_search_options_and_store_are_refused_by_name() {
+        let refusal = |req: &ChatCompletionRequest| {
+            ProviderProfile::validate_hosted_features(req, || false)
+                .err()
+                .map(|error| {
+                    format!(
+                        "{}: {}",
+                        error.code,
+                        error.message.as_deref().unwrap_or_default()
+                    )
+                })
+        };
+        let searched = request(json!({"web_search_options": {"search_context_size": "low"}}));
+        assert!(searched.other.get("web_search_options").is_none());
+        assert_eq!(rejection(&searched), None);
+        assert_eq!(
+            refusal(&searched).as_deref(),
+            Some(
+                "unsupported_parameter: web_search_options is not supported: this server runs \
+                 no web search"
+            )
+        );
+        assert!(ProviderProfile::validate_hosted_features(&searched, || true).is_ok());
+        let stored = request(json!({"store": true, "metadata": {"k": "v"}, "user": "u-1"}));
+        assert!(stored.other.get("store").is_none());
+        assert_eq!(rejection(&stored), None);
+        assert_eq!(
+            refusal(&stored).as_deref(),
+            Some("unsupported_parameter: store is not supported: this server keeps no completions")
+        );
+        assert!(ProviderProfile::validate_hosted_features(&stored, || true).is_ok());
+        assert_eq!(refusal(&request(json!({"store": false}))), None);
+        assert_eq!(refusal(&request(json!({"store": null}))), None);
+        // The hosted provider runs both: a model under the OpenAI profile
+        // keeps them, typed, for the request the provider receives.
+        for extra in [
+            json!({"model": "gpt-4o-search-preview", "web_search_options": {"search_context_size": "low"}}),
+            json!({"model": "gpt-4o", "store": true}),
+        ] {
+            let mut body = json!({"messages": [{"role": "user", "content": "hi"}]});
+            body.as_object_mut()
+                .expect("object")
+                .extend(extra.as_object().expect("object").clone());
+            let hosted: ChatCompletionRequest =
+                serde_json::from_value(body).expect("a well-formed request");
+            assert_eq!(rejection(&hosted), None, "{extra}");
+            let sent = serde_json::to_value(&hosted).expect("serializable");
+            for (field, value) in extra.as_object().expect("object") {
+                assert_eq!(&sent[field], value, "{field} reaches the provider");
+            }
+        }
+    }
+
+    /// The contract's custom tool kind, as a tool or as a named choice, is
+    /// refused by name as the request is read; a function tool without its
+    /// `function` is still a missing field.
+    #[test]
+    fn a_custom_tool_and_a_custom_tool_choice_are_refused_by_name() {
+        let body = |extra: Value| {
+            let mut value = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+            value
+                .as_object_mut()
+                .expect("object")
+                .extend(extra.as_object().expect("object").clone());
+            value
+        };
+        let error = |value: Value| {
+            serde_json::from_value::<ChatCompletionRequest>(value)
+                .expect_err("refused")
+                .to_string()
+        };
+        let refusal = |name: &str| {
+            format!(
+                "unsupported tool type `custom` of `{name}`: this server runs function tools only"
+            )
+        };
+        let custom_tool = body(json!({
+            "tools": [{"type": "custom", "custom": {"name": "code_exec", "description": "runs code"}}]
+        }));
+        assert_eq!(error(custom_tool), refusal("code_exec"));
+        let custom_choice = body(json!({
+            "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+            "tool_choice": {"type": "custom", "custom": {"name": "get_weather"}}
+        }));
+        assert_eq!(error(custom_choice), refusal("get_weather"));
+        assert_eq!(
+            error(body(json!({"tools": [{"type": "function"}]}))),
+            "missing field `function`"
+        );
+        // The `type` decides: a function tool or choice with a custom object
+        // is a function missing its `function`; a bare custom tool is refused
+        // by its kind alone.
+        assert_eq!(
+            error(body(
+                json!({"tools": [{"type": "function", "custom": {"name": "x"}}]})
+            )),
+            "missing field `function`"
+        );
+        assert_eq!(
+            error(body(json!({
+                "tools": [{"type": "function", "function": {"name": "f"}}],
+                "tool_choice": {"type": "function", "custom": {"name": "f"}}
+            }))),
+            "missing field `function`"
+        );
+        assert_eq!(
+            error(body(json!({"tools": [{"type": "custom"}]}))),
+            "unsupported tool type `custom`: this server runs function tools only"
+        );
     }
 }
 

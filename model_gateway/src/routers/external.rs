@@ -306,6 +306,12 @@ impl RouterTrait for ExternalRouterAdapter {
         self.inner.router_type()
     }
 
+    /// A request this adapter takes goes to its provider, which may run the
+    /// hosted features; the chat extractor reads it through the gateway.
+    fn forwards_to_provider(&self, _model_id: &str) -> bool {
+        true
+    }
+
     async fn health_generate(&self, req: Request<Body>) -> Response {
         self.inner.health_generate(req).await
     }
@@ -496,5 +502,37 @@ mod tests {
         assert!(posted.get("rid").is_none(), "{posted}");
         assert_eq!(posted["model"], "m");
         assert_eq!(posted["messages"][0]["content"], "q");
+    }
+
+    /// A provider router of the kind the adapter mounts: the trait's two
+    /// required methods, every route its default.
+    #[derive(Debug)]
+    struct StubProvider;
+
+    #[async_trait]
+    impl ExternalRouter for StubProvider {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn router_type(&self) -> &'static str {
+            "stub"
+        }
+    }
+
+    /// The adapter forwards the hosted features: a request it takes goes to
+    /// a provider. The gateway's selection reads this answer, so the chat
+    /// extractor passes `store` and `web_search_options` to a provider's
+    /// model and refuses them on an engine's.
+    #[test]
+    fn the_adapter_forwards_to_its_provider() {
+        let adapter = ExternalRouterAdapter {
+            spec: spec_for_provider(None).expect("the OpenAI-compatible spec"),
+            inner: Arc::new(StubProvider),
+            rate_limit_manager: None,
+            worker_registry: Arc::new(WorkerRegistry::new()),
+        };
+        assert!(adapter.forwards_to_provider("sonar-pro"));
+        assert!(adapter.forwards_to_provider("any-model"));
     }
 }

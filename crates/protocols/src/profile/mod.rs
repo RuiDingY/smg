@@ -27,7 +27,7 @@ use std::{
 
 use crate::{
     chat::{thinking_from_reasoning_effort, ChatCompletionRequest, ChatMessage},
-    common::{invalid, Tool},
+    common::{invalid, invalid_at, Tool},
     ext::retain_if,
 };
 
@@ -441,7 +441,11 @@ impl ProviderProfile {
         None
     }
 
-    /// Contract rules applied on top of core validation.
+    /// Contract rules applied on top of core validation: the dialect's own
+    /// (the `root` role, tool pairing, the vendor's fields), decided by the
+    /// model name. The hosted features (`store: true`, `web_search_options`)
+    /// are decided by where the request goes, through
+    /// [`Self::validate_hosted_features`].
     pub fn validate_chat(
         self,
         req: &ChatCompletionRequest,
@@ -468,6 +472,28 @@ impl ProviderProfile {
             ProviderProfile::Generic => reject_root(req),
         }
     }
+
+    /// The contract's features that run on a hosted provider alone, a web
+    /// search and a stored completion. A model the local engines serve
+    /// refuses them by name (`unsupported_parameter` at the field), never
+    /// answering as if they had run. A model under the OpenAI profile keeps
+    /// them for the provider that runs them, and so does a request an external
+    /// provider's router takes, which `served_externally` tells: the gateway
+    /// reads it from its router selection, and only here, when one of the two
+    /// fields is present. A request without them costs nothing: neither the
+    /// profile nor the fact is read.
+    pub fn validate_hosted_features(
+        req: &ChatCompletionRequest,
+        served_externally: impl FnOnce() -> bool,
+    ) -> Result<(), validator::ValidationError> {
+        if req.web_search_options.is_none() && req.store != Some(true) {
+            return Ok(());
+        }
+        if matches!(Self::for_model(&req.model), ProviderProfile::OpenAi) || served_externally() {
+            return Ok(());
+        }
+        reject_hosted_features(req)
+    }
 }
 
 /// Case-insensitive ASCII prefix test that does not allocate.
@@ -491,8 +517,10 @@ fn effort_fields(req: &mut ChatCompletionRequest) -> impl Iterator<Item = &mut S
 
 /// Whether the model id names one of OpenAI's own hosted models: `gpt-*`
 /// (but not the open-weight `gpt-oss-*`), `chatgpt-*`, `codex-*`, the
-/// `o1`/`o3`/`o4` reasoning series, `computer-use-preview`, or a model behind
-/// an `openai` route segment such as `openai/gpt-4.1`.
+/// `o1`/`o3`/`o4` reasoning series, `computer-use-preview`, a model behind
+/// an `openai` route segment such as `openai/gpt-4.1`, or a fine-tune of one
+/// of them, whose id carries the base model after `ft:`
+/// (`ft:gpt-4o-mini-2024-07-18:org:suffix:id`).
 ///
 /// The rules the public OpenAI API enforces on request *content* beyond the
 /// schema (a strict-mode schema must pin `additionalProperties: false` on
@@ -510,20 +538,35 @@ pub fn is_openai_vendor_model(model: &str) -> bool {
         "omni-moderation",
     ];
     // The open-weight gpt-oss models are served locally whatever route
-    // segment precedes them: never the vendor's hosted contract.
+    // segment precedes them, fine-tuned or not: never the vendor's hosted
+    // contract.
     if model
         .split('/')
+        .map(fine_tune_base)
         .any(|segment| starts_with_ignore_ascii_case(segment, "gpt-oss"))
     {
         return false;
     }
-    model.split('/').any(|segment| {
+    model.split('/').map(fine_tune_base).any(|segment| {
         segment.eq_ignore_ascii_case("openai")
             || PREFIXES
                 .iter()
                 .any(|prefix| starts_with_ignore_ascii_case(segment, prefix))
             || is_openai_reasoning_series(segment)
     })
+}
+
+/// The base model of a fine-tuned id, `ft:<base>:<org>:<suffix>:<id>` (the
+/// vendor's own form, `ft:gpt-4o-mini-2024-07-18:org:suffix:id`): the fine-tune
+/// runs where its base runs. Any other segment is its own base.
+fn fine_tune_base(segment: &str) -> &str {
+    match segment.get(..3) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("ft:") => {
+            let rest = &segment[3..];
+            rest.split(':').next().unwrap_or(rest)
+        }
+        _ => segment,
+    }
 }
 
 /// `o1`, `o3`, `o4-mini`, `o3-pro-2025-06-10`: an `o`, the series digit, then
@@ -533,6 +576,28 @@ fn is_openai_reasoning_series(segment: &str) -> bool {
     matches!(chars.next(), Some('o' | 'O'))
         && matches!(chars.next(), Some('1' | '3' | '4'))
         && matches!(chars.next(), None | Some('-'))
+}
+
+/// The contract's features that run on a hosted provider alone, a web search
+/// and a stored completion, refused by name for a model the local engines
+/// serve, never answering as if they had run. Who keeps them is
+/// [`ProviderProfile::validate_hosted_features`]'s call.
+fn reject_hosted_features(req: &ChatCompletionRequest) -> Result<(), validator::ValidationError> {
+    if req.web_search_options.is_some() {
+        return Err(invalid_at(
+            "web_search_options",
+            "unsupported_parameter",
+            "web_search_options is not supported: this server runs no web search",
+        ));
+    }
+    if req.store == Some(true) {
+        return Err(invalid_at(
+            "store",
+            "unsupported_parameter",
+            "store is not supported: this server keeps no completions",
+        ));
+    }
+    Ok(())
 }
 
 /// The `root` role is a MiniMax-only extension; other dialects reject it the
@@ -735,6 +800,10 @@ mod tests {
             "computer-use-preview",
             "openai/gpt-4.1",
             "openrouter/openai/o3",
+            "ft:gpt-4o-mini-2024-07-18:org:suffix:id",
+            "FT:gpt-4.1-2025-04-14:acme::ftjob-1",
+            "ft:o4-mini-2025-04-16:org:suffix:id",
+            "openai/ft:gpt-4o-mini-2024-07-18:org:suffix:id",
         ] {
             assert!(is_openai_vendor_model(model), "{model}");
         }
@@ -743,6 +812,10 @@ mod tests {
             "meta-llama/Llama-3.3-70B-Instruct",
             "openai/gpt-oss-120b",
             "gpt-oss-20b",
+            "ft:gpt-oss-20b:org:suffix:id",
+            "ft:Qwen2.5-7B-Instruct:org:suffix:id",
+            "ft:",
+            "ft",
             "olmo-2",
             "o5",
             "m1",
@@ -750,6 +823,101 @@ mod tests {
         ] {
             assert!(!is_openai_vendor_model(model), "{model}");
         }
+    }
+
+    /// A fine-tune of a hosted OpenAI model keeps the hosted features its base
+    /// has (the provider stores completions for it), where a fine-tune of a
+    /// self-hosted base is refused by name like its base.
+    #[test]
+    fn a_fine_tuned_openai_model_keeps_store_where_a_self_hosted_fine_tune_refuses_it() {
+        let code = |model: &str| {
+            let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "store": true,
+            }))
+            .expect("request deserializes");
+            ProviderProfile::validate_hosted_features(&req, || false)
+                .err()
+                .map(|error| error.code.to_string())
+        };
+        assert_eq!(
+            ProviderProfile::for_model("ft:gpt-4o-mini-2024-07-18:org:suffix:id"),
+            ProviderProfile::OpenAi
+        );
+        assert_eq!(code("ft:gpt-4o-mini-2024-07-18:org:suffix:id"), None);
+        assert_eq!(code("gpt-4o-mini"), None);
+        for model in [
+            "ft:gpt-oss-20b:org:suffix:id",
+            "ft:Qwen2.5-7B-Instruct:org:suffix:id",
+        ] {
+            assert_eq!(
+                code(model).as_deref(),
+                Some("unsupported_parameter"),
+                "{model}"
+            );
+        }
+    }
+
+    /// A request served externally keeps the hosted features (the provider
+    /// behind the router runs them), whatever its model's name; the same name
+    /// bound for a local engine is refused by name; and the fact is not read
+    /// when no hosted field is present, nor under the OpenAI profile.
+    #[test]
+    fn a_model_served_externally_keeps_its_hosted_features() {
+        let request = |model: &str, extra: serde_json::Value| -> ChatCompletionRequest {
+            let mut body = serde_json::json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "Hello"}],
+            });
+            body.as_object_mut()
+                .expect("object")
+                .extend(extra.as_object().expect("object").clone());
+            serde_json::from_value(body).expect("request deserializes")
+        };
+        let searched = request(
+            "sonar-pro",
+            serde_json::json!({"web_search_options": {"search_context_size": "low"}}),
+        );
+        let stored = request("prod-chat", serde_json::json!({"store": true}));
+        for (req, param) in [(&searched, "web_search_options"), (&stored, "store")] {
+            assert_eq!(
+                ProviderProfile::for_model(&req.model),
+                ProviderProfile::Generic
+            );
+            assert!(
+                ProviderProfile::validate_hosted_features(req, || true).is_ok(),
+                "{}",
+                req.model
+            );
+            let refused = ProviderProfile::validate_hosted_features(req, || false)
+                .expect_err("refused on an engine");
+            assert_eq!(refused.code, "unsupported_parameter");
+            assert_eq!(
+                refused.params.get("field"),
+                Some(&serde_json::json!(param)),
+                "{}",
+                req.model
+            );
+        }
+        // The fact is read only where a refusal would fire.
+        let consulted = std::cell::Cell::new(false);
+        let plain = request("sonar-pro", serde_json::json!({}));
+        assert!(ProviderProfile::validate_hosted_features(&plain, || {
+            consulted.set(true);
+            true
+        })
+        .is_ok());
+        let hosted = request("gpt-4o", serde_json::json!({"store": true}));
+        assert!(ProviderProfile::validate_hosted_features(&hosted, || {
+            consulted.set(true);
+            true
+        })
+        .is_ok());
+        assert!(
+            !consulted.get(),
+            "the fact was read where no refusal could fire"
+        );
     }
 
     #[test]
