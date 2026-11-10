@@ -228,6 +228,9 @@ pub struct Decider {
     /// (`least_load`'s setting, the scorer's default under `power_of_two`),
     /// nothing otherwise.
     mean_prompt_tokens: u32,
+    /// The token-work a pair's request of unknown size is booked at: the
+    /// prefill profile's mean, as the prefill policy prices it.
+    mean_prefill_prompt_tokens: u32,
 }
 
 impl std::fmt::Debug for Decider {
@@ -269,6 +272,7 @@ impl Decider {
         if let Some(profile) = spec.profiles.get_mut("decode") {
             tune(profile, decode);
         }
+        let mean_prefill_prompt_tokens = spec.profiles.get("prefill").map_or(0, mean_prefill_of);
         let default_profile = profile_of(default)?;
         let mean_prompt_tokens = mean_prefill_of(&default_profile);
         spec.profiles.insert("default".to_string(), default_profile);
@@ -290,6 +294,7 @@ impl Decider {
             origin: Instant::now(),
             seq: AtomicU64::new(1),
             mean_prompt_tokens,
+            mean_prefill_prompt_tokens,
         })
     }
 
@@ -341,9 +346,14 @@ impl Decider {
     /// `mean_prefill_tokens`, as the legacy policy prices it; nothing under a
     /// policy that does not price tokens).
     pub fn prompt_tokens(&self, tokens: Option<&[u32]>) -> u32 {
-        tokens.map_or(self.mean_prompt_tokens, |tokens| {
-            u32::try_from(tokens.len()).unwrap_or(u32::MAX)
-        })
+        counted_or(tokens, self.mean_prompt_tokens)
+    }
+
+    /// [`Self::prompt_tokens`] for a pair: a request of unknown size is
+    /// booked at the prefill profile's mean, the prefill policy's own
+    /// estimate; the pair's lease credits both sides with it.
+    pub fn prefill_prompt_tokens(&self, tokens: Option<&[u32]>) -> u32 {
+        counted_or(tokens, self.mean_prefill_prompt_tokens)
     }
 
     /// Hand the engine the worker monitor's load feed.
@@ -790,6 +800,13 @@ fn narrow(count: i64) -> u32 {
 }
 
 /// A ratio as the row's permille field.
+/// A prompt's token count when the host has the tokens, else `mean`.
+fn counted_or(tokens: Option<&[u32]>, mean: u32) -> u32 {
+    tokens.map_or(mean, |tokens| {
+        u32::try_from(tokens.len()).unwrap_or(u32::MAX)
+    })
+}
+
 fn permille(ratio: f64) -> u16 {
     (ratio * 1000.0).round().clamp(0.0, 1000.0) as u16
 }
@@ -1837,5 +1854,26 @@ mod tests {
             Some(0),
             "the retired handle reads idle: the retirement waited for the booking it then pruned"
         );
+    }
+
+    /// A pair's request of unknown size is booked at the prefill profile's
+    /// mean (the prefill policy's own estimate), whatever the default profile
+    /// prices; a counted prompt is booked as counted.
+    #[test]
+    fn a_pairs_unknown_prompt_size_is_booked_at_the_prefill_profiles_mean() {
+        let least_load = PolicyConfig::LeastLoad {
+            kv_pressure_weight: 0.0,
+            mean_prefill_tokens: 100,
+            default_throughput: 1000.0,
+        };
+        let decider = Decider::from_configs(&PolicyConfig::RoundRobin, &least_load, &least_load)
+            .expect("carried policies");
+        assert_eq!(
+            decider.prompt_tokens(None),
+            0,
+            "round robin prices no tokens"
+        );
+        assert_eq!(decider.prefill_prompt_tokens(None), 100);
+        assert_eq!(decider.prefill_prompt_tokens(Some(&[1, 2, 3])), 3);
     }
 }
