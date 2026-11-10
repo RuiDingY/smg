@@ -30,8 +30,10 @@ use crate::{
         metrics::{metrics_labels, Metrics},
     },
     policies::{
-        as_consistent_hashing, engine_host::HostRequest, policy_filters_unavailable_workers,
-        CacheNamespace, Decider, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerRole,
+        as_cache_aware, as_consistent_hashing,
+        engine_host::{Affinity, HostRequest},
+        policy_filters_unavailable_workers, CacheNamespace, Decider, LoadBalancingPolicy,
+        PolicyRegistry, SelectWorkerInfo, WorkerRole,
     },
     routers::{
         common::{header_utils, overload, pd_admission, retry::mark_non_retryable},
@@ -317,6 +319,12 @@ pub(crate) fn select_from(
                 overload_lifted: info.overload_lifted,
                 phase: Phase::Single,
                 has_capacity: None,
+                // A cache-aware decision reads its affinity through the
+                // policy's own index and trees.
+                affinity: as_cache_aware(policy.as_ref()).map(|policy| Affinity {
+                    policy,
+                    info: &info,
+                }),
             },
             eligible: &eligible,
             policy: policy.name(),
@@ -445,6 +453,13 @@ fn select_from_decided(rd: RegularDecision<'_>) -> Option<Arc<dyn Worker>> {
         return overload_fallback(registry, policy, model_id, candidates);
     };
     let position = target.position as usize;
+    // The route goes into the policy's tree where the legacy selection
+    // records it (the event index is the engines').
+    if let Some(source) = request.affinity {
+        source
+            .policy
+            .record_route(candidates, position, source.info);
+    }
     cache_trace::selection(policy, "policy", candidates, Some(position));
     let selected = Arc::clone(&candidates[position]);
     Metrics::record_worker_selection(
@@ -2503,6 +2518,57 @@ mod tests {
             },
         )
         .is_some());
+    }
+
+    /// The engine serves cache_aware as the legacy path does: the holder of
+    /// a prompt's prefix keeps it under both switch values, a retry leaves
+    /// the holder, and under the engine every placement is its decision.
+    #[test]
+    fn a_cache_aware_prefix_keeps_its_holder_under_both_switch_values() {
+        for mode in [PolicyEngineMode::Legacy, PolicyEngineMode::Engine] {
+            let registry = http_registry(&["http://h:1", "http://h:2"]);
+            let policies = PolicyRegistry::new(cache_aware_policy()).with_policy_engine(
+                mode,
+                &cache_aware_policy(),
+                &cache_aware_policy(),
+            );
+            let text = "a prompt long enough to fill a few blocks of the tree on its first request";
+            let inputs = PlacementInputs {
+                text: Some(text),
+                ..Default::default()
+            };
+            let holder = pick(&registry, &policies, inputs);
+            for _ in 0..8 {
+                assert_eq!(
+                    pick(&registry, &policies, inputs).url(),
+                    holder.url(),
+                    "{mode:?}: the prefix pins the prompt to its holder"
+                );
+            }
+            let tried = vec![holder.base_url().to_string()];
+            let moved = pick(
+                &registry,
+                &policies,
+                PlacementInputs {
+                    tried: &tried,
+                    ..inputs
+                },
+            );
+            assert_ne!(
+                moved.url(),
+                holder.url(),
+                "{mode:?}: the retry leaves the holder"
+            );
+            let decided = policies.decider().map_or(0, |decider| decider.decisions());
+            assert_eq!(
+                decided,
+                if mode == PolicyEngineMode::Engine {
+                    10
+                } else {
+                    0
+                }
+            );
+        }
     }
 
     /// An explicit target under consistent hashing indexes the unfiltered
