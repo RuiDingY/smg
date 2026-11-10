@@ -543,8 +543,13 @@ impl WorkerService {
 
         // Reserve (or retrieve) a stable ID for the 202 response.
         // If this URL already has an active worker, reject with 409.
+        // A data-parallel engine's rows hold their own IDs, so its group is the
+        // conflict for the bare URL: a second POST must not release the
+        // reservation the first one's Location resolves through.
         let worker_id = self.worker_registry.reserve_id_for_url(&worker_url);
-        if self.worker_registry.get(&worker_id).is_some() {
+        if self.worker_registry.get(&worker_id).is_some()
+            || !self.dp_group_for_url(&worker_url).is_empty()
+        {
             return Err(WorkerServiceError::Conflict {
                 url: worker_url,
                 worker_id,
@@ -722,6 +727,19 @@ impl WorkerService {
         }
     }
 
+    /// The rank rows a data-parallel engine registered under `url`, lowest
+    /// rank first; empty for a plain worker's URL and for an unknown one.
+    fn dp_group_for_url(&self, url: &str) -> Vec<Arc<dyn Worker>> {
+        let mut ranks: Vec<Arc<dyn Worker>> = self
+            .worker_registry
+            .get_all()
+            .into_iter()
+            .filter(|worker| worker.is_dp_aware() && worker.base_url() == url)
+            .collect();
+        ranks.sort_by_key(|worker| worker.dp_rank());
+        ranks
+    }
+
     pub fn get_worker(&self, worker_id_raw: &str) -> Result<GetWorkerResponse, WorkerServiceError> {
         let worker_id = Self::parse_worker_id(worker_id_raw)?;
         let job_queue = self.get_job_queue()?;
@@ -741,13 +759,7 @@ impl WorkerService {
             // per rank, each under its own ID; the ID the POST answered with
             // resolves to the group's first rank, so its Location can be
             // followed to a registered worker (and its group size).
-            let mut ranks: Vec<Arc<dyn Worker>> = self
-                .worker_registry
-                .get_all()
-                .into_iter()
-                .filter(|worker| worker.is_dp_aware() && worker.base_url() == worker_url)
-                .collect();
-            ranks.sort_by_key(|worker| worker.dp_rank());
+            let ranks = self.dp_group_for_url(&worker_url);
             if let Some(first) = ranks.first() {
                 let mut worker_info = worker_to_info(first);
                 worker_info.id = worker_id.as_str().to_string();
