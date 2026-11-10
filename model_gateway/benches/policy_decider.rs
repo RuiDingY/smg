@@ -10,13 +10,17 @@
 //! - `engine_decided`: the decision outside the lock, the commit under it
 //!   (`PrefillAdmission::admit_decided`).
 //!
-//! Sections (`PD_SECTIONS`, default both): `fifo` (a window that never binds:
-//! the lock hold alone) and `window` (a binding window: queueing and
-//! commit misses). The pair and decode-room sections arrive with the pair seam.
-//! Fleets from `PD_FLEETS` (default 8,64,512), `PD_TASKS` tasks (64) on eight
-//! runtime threads, `PD_PER_TASK` admissions each (2000). Output: TSV rows on
-//! stdout: `section  shape  policy  workers  p50_ns  p99_ns  per_s  misses
-//! rejects`.
+//! Sections (`PD_SECTIONS`, default all four): `fifo` (a window that never
+//! binds: the lock hold alone), `window` (a binding window: queueing and
+//! commit misses), `rooms` (the decode room claim with no shared lock: the
+//! room pre-filter and the atomic claim against the engine's room bit and the
+//! claim as the commit) and `pair` (the pair plan under the FIFO: the prefill
+//! selection and its partner's room under the lock against the engine's pair
+//! decision under it and outside it). Fleets from `PD_FLEETS` (default
+//! 8,64,512; the pair section runs a quarter as many prefills, two at least),
+//! `PD_TASKS` tasks (64) on eight runtime threads, `PD_PER_TASK` admissions
+//! each (2000), `PD_ROOMS` rooms per decode (4). Output: TSV rows on stdout:
+//! `section  shape  policy  workers  p50_ns  p99_ns  per_s  misses  rejects`.
 #![expect(
     clippy::unwrap_used,
     clippy::print_stdout,
@@ -78,6 +82,25 @@ fn pool(n: usize, kind: WorkerType, prefix: &str) -> Vec<Arc<dyn Worker>> {
         .map(|i| {
             let builder = BasicWorkerBuilder::new(format!("http://{prefix}-{i:03}:8000"))
                 .worker_type(kind)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                });
+            Arc::new(builder.build()) as Arc<dyn Worker>
+        })
+        .collect()
+}
+
+/// A decode fleet whose engines run `rooms` requests at once: the label the
+/// gateway's room gate reads.
+fn decode_pool(n: usize, rooms: usize) -> Vec<Arc<dyn Worker>> {
+    (0..n)
+        .map(|i| {
+            let mut labels = HashMap::new();
+            labels.insert("max_running_requests".to_string(), rooms.to_string());
+            let builder = BasicWorkerBuilder::new(format!("http://decode-{i:03}:8000"))
+                .worker_type(WorkerType::Decode)
+                .labels(labels)
                 .health_config(HealthCheckConfig {
                     disable_health_check: true,
                     ..Default::default()
@@ -203,8 +226,9 @@ struct Policies {
 }
 
 /// The legacy policy and the engine under one configuration; under
-/// `least_load` both read one load feed carrying a report per worker.
-fn policies(name: &str, pool: &[Arc<dyn Worker>]) -> Policies {
+/// `least_load` both read one load feed carrying a report per worker of
+/// every pool given.
+fn policies(name: &str, pools: &[&[Arc<dyn Worker>]]) -> Policies {
     let (legacy, config): (Arc<dyn LoadBalancingPolicy>, PolicyConfig) = match name {
         "least_load" => (
             Arc::new(LeastLoadPolicy::new()),
@@ -219,7 +243,11 @@ fn policies(name: &str, pool: &[Arc<dyn Worker>]) -> Policies {
     let decider = Arc::new(Decider::from_configs(&config, &config, &config).unwrap());
     let feed = (name == "least_load").then(|| {
         let feed = TestFeed::attached_to(legacy.as_ref());
-        feed.publish(&reports_for(pool));
+        let mut reports = HashMap::new();
+        for pool in pools {
+            reports.extend(reports_for(pool));
+        }
+        feed.publish(&reports);
         decider.set_load_receiver(Some(feed.receiver()));
         feed
     });
@@ -325,7 +353,7 @@ fn section_prefill(
     for &n in fleets {
         let prefills = pool(n, WorkerType::Prefill, "prefill");
         for name in names {
-            let p = Arc::new(policies(name, &prefills));
+            let p = Arc::new(policies(name, &[&prefills]));
             let queue = tasks.max(1);
             for shape in ["legacy_under_lock", "engine_under_lock", "engine_decided"] {
                 let admission = Arc::new(PrefillAdmission::new(
@@ -441,22 +469,384 @@ fn section_prefill(
     }
 }
 
+// ───────────────────────── the decode room claim ─────────────────────────
+
+/// The room gate's free-room read, as the decode pick's pre-filter asks it.
+fn has_free_room(decode: &dyn Worker) -> bool {
+    decode
+        .max_running_requests()
+        .is_none_or(|window| decode.pd_admitted() + decode.pd_waiting_rooms() < usize::from(window))
+}
+
+/// The decode room claim with no shared lock: today's shape (the room
+/// pre-filter, the policy over the handles, the atomic claim, a lost claim
+/// re-selected up to four times) against the engine's (the room bit in the
+/// view as a soft filter, the claim as the commit over the ordered targets).
+fn section_rooms(fleets: &[usize], tasks: usize, per_task: usize, rooms: usize, names: &[String]) {
+    for &n in fleets {
+        let decodes = decode_pool(n, rooms);
+        let window = rooms;
+        for name in names {
+            let p = Arc::new(policies(name, &[&decodes]));
+            for shape in ["legacy_claim", "engine_claim"] {
+                let counters = Arc::new(Counters::default());
+                let decodes = decodes.clone();
+                let p = Arc::clone(&p);
+                let policy_name = p.name;
+                let c = Arc::clone(&counters);
+                let row = if shape == "legacy_claim" {
+                    run_concurrent(tasks, per_task, move |_| {
+                        let decodes = decodes.clone();
+                        let p = Arc::clone(&p);
+                        let c = Arc::clone(&c);
+                        async move {
+                            for _ in 0..4 {
+                                let with_room: Vec<Arc<dyn Worker>> = decodes
+                                    .iter()
+                                    .filter(|d| has_free_room(d.as_ref()))
+                                    .cloned()
+                                    .collect();
+                                let candidates = if with_room.is_empty() {
+                                    &decodes
+                                } else {
+                                    &with_room
+                                };
+                                let info = SelectWorkerInfo {
+                                    role: WorkerRole::Decode,
+                                    ..SelectWorkerInfo::default()
+                                };
+                                let Some(idx) = p.legacy.select_worker(candidates, &info) else {
+                                    c.rejects.fetch_add(1, Ordering::Relaxed);
+                                    return;
+                                };
+                                if candidates[idx].try_admit_pd(1, window) {
+                                    candidates[idx].release_pd(1);
+                                    return;
+                                }
+                                c.misses.fetch_add(1, Ordering::Relaxed);
+                            }
+                            c.rejects.fetch_add(1, Ordering::Relaxed);
+                        }
+                    })
+                } else {
+                    run_concurrent(tasks, per_task, move |_| {
+                        let decodes = decodes.clone();
+                        let p = Arc::clone(&p);
+                        let c = Arc::clone(&c);
+                        async move {
+                            let request = HostRequest {
+                                model: "m",
+                                prompt_tokens: 1024,
+                                phase: Phase::Decode,
+                                ..HostRequest::default()
+                            };
+                            let (decision, lease) = p.decider.decide(&request, &decodes, &[]);
+                            let claimed =
+                                p.decider
+                                    .commit(&lease, &decision, Side::Decode, |t: &Target| {
+                                        decodes[t.position as usize].try_admit_pd(1, window)
+                                    });
+                            match claimed {
+                                Some(t) => decodes[t.position as usize].release_pd(1),
+                                None => {
+                                    c.misses.fetch_add(1, Ordering::Relaxed);
+                                    c.rejects.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    })
+                };
+                print_row("rooms", shape, policy_name, n, &row, &counters);
+            }
+        }
+    }
+}
+
+// ───────────────────────── the pair plan under the FIFO ─────────────────────────
+
+type PairArms = (Arc<dyn Worker>, Arc<dyn Worker>);
+
+/// What the engine's pair decision hands the commit: the decision, its lease
+/// and the decode rows the targets' pair sides index.
+type PairPlan = (Decision, Lease, Vec<Arc<dyn Worker>>);
+
+/// Prefill `i`'s partners.
+type Partners = Arc<Vec<Vec<Arc<dyn Worker>>>>;
+
+/// Today's pair selection at the queue head: the capacity pre-filter, the
+/// prefill policy over the open prefills, the room pre-filter over its
+/// partners, the decode policy over them.
+fn legacy_pair(
+    policy: &dyn LoadBalancingPolicy,
+    prefills: &[Arc<dyn Worker>],
+    partners_of: &[Vec<Arc<dyn Worker>>],
+    capacity: Option<&PrefillSelectionContext<'_>>,
+) -> Result<PairArms, Verdict> {
+    let open: Vec<usize> = (0..prefills.len())
+        .filter(|&i| capacity.is_none_or(|c| c.has_capacity(&prefills[i])))
+        .collect();
+    if open.is_empty() {
+        return Err(Verdict::AtCapacity);
+    }
+    let open_workers: Vec<Arc<dyn Worker>> =
+        open.iter().map(|&i| Arc::clone(&prefills[i])).collect();
+    let mut info = SelectWorkerInfo {
+        role: WorkerRole::Prefill,
+        ..SelectWorkerInfo::default()
+    };
+    let pi = policy
+        .select_worker(&open_workers, &info)
+        .ok_or(Verdict::Unavailable)?;
+    let partners = &partners_of[open[pi]];
+    let with_room: Vec<Arc<dyn Worker>> = partners
+        .iter()
+        .filter(|d| has_free_room(d.as_ref()))
+        .cloned()
+        .collect();
+    let decodes = if with_room.is_empty() {
+        partners
+    } else {
+        &with_room
+    };
+    info.role = WorkerRole::Decode;
+    let di = policy
+        .select_worker(decodes, &info)
+        .ok_or(Verdict::Unavailable)?;
+    Ok((Arc::clone(&open_workers[pi]), Arc::clone(&decodes[di])))
+}
+
+/// The engine's pair decision over the prefills with the window bits and
+/// their partners with the room bits.
+fn engine_pair_decision(
+    decider: &Decider,
+    prefills: &[Arc<dyn Worker>],
+    partners_of: &Partners,
+    has_capacity: &dyn Fn(&Arc<dyn Worker>) -> bool,
+    excluded: &[WorkerId],
+) -> Result<PairPlan, Verdict> {
+    let partners = |i: usize| partners_of[i].clone();
+    let request = HostRequest {
+        model: "m",
+        prompt_tokens: 1024,
+        phase: Phase::Prefill,
+        ..HostRequest::default()
+    };
+    let (decision, lease, decodes) =
+        decider.decide_pair(&request, prefills, has_capacity, &partners, false, excluded);
+    match decision {
+        Decision::Pick(_) => Ok((decision, lease, decodes)),
+        Decision::Shed(shed) if shed.emptied_by == "has-capacity" => Err(Verdict::AtCapacity),
+        Decision::Shed(_) | Decision::Queue(_) => Err(Verdict::Unavailable),
+    }
+}
+
+/// The commit of a pair decision under the window as the lock reads it: the
+/// first target whose prefill has capacity, its decode side the pair's
+/// decode; a miss records the refused targets' ids for the re-decision.
+fn engine_pair_commit(
+    decider: &Decider,
+    prefills: &[Arc<dyn Worker>],
+    (decision, lease, decodes): PairPlan,
+    capacity: Option<&PrefillSelectionContext<'_>>,
+    counters: &Counters,
+    missed: &std::sync::Mutex<Vec<WorkerId>>,
+) -> Result<PairArms, Verdict> {
+    let committed = decider.commit(&lease, &decision, Side::Prefill, |t: &Target| {
+        capacity.is_none_or(|c| c.has_capacity(&prefills[t.position as usize])) && t.pair.is_some()
+    });
+    match committed {
+        Some(t) => {
+            let decode = t
+                .pair
+                .map(|pair| &decodes[pair.decode_position as usize])
+                .unwrap();
+            Ok((
+                Arc::clone(&prefills[t.position as usize]),
+                Arc::clone(decode),
+            ))
+        }
+        None => {
+            counters.misses.fetch_add(1, Ordering::Relaxed);
+            if let Some(pick) = decision.pick() {
+                let mut missed = missed.lock().unwrap();
+                for t in pick.targets.iter() {
+                    missed.push(t.id);
+                    missed.extend(t.pair.map(|pair| pair.decode_id));
+                }
+            }
+            Err(Verdict::AtCapacity)
+        }
+    }
+}
+
+/// The pair plan under the FIFO: a quarter as many prefills as decodes (two
+/// at least), prefill `i` partnered with the decodes `j` where `j % prefills
+/// == i`, the window never binding (the lock hold and the view build alone).
+fn section_pair(fleets: &[usize], tasks: usize, per_task: usize, window: usize, names: &[String]) {
+    for &n in fleets {
+        let prefill_count = (n / 4).max(2);
+        let prefills = pool(prefill_count, WorkerType::Prefill, "prefill");
+        let decodes = decode_pool(n, 4_096);
+        let partners_of: Partners = Arc::new(
+            (0..prefill_count)
+                .map(|i| {
+                    decodes
+                        .iter()
+                        .enumerate()
+                        .filter(|(j, _)| j % prefill_count == i)
+                        .map(|(_, d)| Arc::clone(d))
+                        .collect()
+                })
+                .collect(),
+        );
+        for name in names {
+            let p = Arc::new(policies(name, &[&prefills, &decodes]));
+            for shape in ["legacy_under_lock", "engine_under_lock", "engine_decided"] {
+                let admission = Arc::new(PrefillAdmission::new(
+                    window,
+                    tasks.max(1),
+                    Duration::from_secs(30),
+                ));
+                let counters = Arc::new(Counters::default());
+                let prefills = prefills.clone();
+                let partners_of = Arc::clone(&partners_of);
+                let p = Arc::clone(&p);
+                let policy_name = p.name;
+                let c = Arc::clone(&counters);
+                let row = match shape {
+                    "legacy_under_lock" => run_concurrent(tasks, per_task, move |_| {
+                        let admission = Arc::clone(&admission);
+                        let prefills = prefills.clone();
+                        let partners_of = Arc::clone(&partners_of);
+                        let p = Arc::clone(&p);
+                        let c = Arc::clone(&c);
+                        async move {
+                            let result = acquire_prefill(
+                                Some(&admission),
+                                None,
+                                |pair: &PairArms| &pair.0,
+                                |capacity| {
+                                    legacy_pair(
+                                        p.legacy.as_ref(),
+                                        &prefills,
+                                        &partners_of,
+                                        capacity,
+                                    )
+                                },
+                            )
+                            .await;
+                            match result {
+                                Ok((_, guard)) => drop(guard),
+                                Err(_) => {
+                                    c.rejects.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    }),
+                    "engine_under_lock" => run_concurrent(tasks, per_task, move |_| {
+                        let admission = Arc::clone(&admission);
+                        let prefills = prefills.clone();
+                        let partners_of = Arc::clone(&partners_of);
+                        let p = Arc::clone(&p);
+                        let c = Arc::clone(&c);
+                        async move {
+                            let missed: std::sync::Mutex<Vec<WorkerId>> =
+                                std::sync::Mutex::new(Vec::new());
+                            let result = acquire_prefill(
+                                Some(&admission),
+                                None,
+                                |pair: &PairArms| &pair.0,
+                                |capacity| {
+                                    let has = |w: &Arc<dyn Worker>| {
+                                        capacity.is_none_or(|c| c.has_capacity(w))
+                                    };
+                                    let proposal = engine_pair_decision(
+                                        &p.decider,
+                                        &prefills,
+                                        &partners_of,
+                                        &has,
+                                        &missed.lock().unwrap().clone(),
+                                    )?;
+                                    engine_pair_commit(
+                                        &p.decider, &prefills, proposal, capacity, &c, &missed,
+                                    )
+                                },
+                            )
+                            .await;
+                            match result {
+                                Ok((_, guard)) => drop(guard),
+                                Err(_) => {
+                                    c.rejects.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    }),
+                    _ => run_concurrent(tasks, per_task, move |_| {
+                        let admission = Arc::clone(&admission);
+                        let prefills = prefills.clone();
+                        let partners_of = Arc::clone(&partners_of);
+                        let p = Arc::clone(&p);
+                        let c = Arc::clone(&c);
+                        async move {
+                            let missed: std::sync::Mutex<Vec<WorkerId>> =
+                                std::sync::Mutex::new(Vec::new());
+                            let result = acquire_prefill_decided(
+                                Some(&admission),
+                                None,
+                                |pair: &PairArms| &pair.0,
+                                // the pools are the model's healthy prefills and their partners
+                                || Ok(()),
+                                |window: &CapacityWindow| {
+                                    let has = |w: &Arc<dyn Worker>| window.has_capacity(w);
+                                    engine_pair_decision(
+                                        &p.decider,
+                                        &prefills,
+                                        &partners_of,
+                                        &has,
+                                        &missed.lock().unwrap().clone(),
+                                    )
+                                },
+                                |capacity, proposal| {
+                                    engine_pair_commit(
+                                        &p.decider, &prefills, proposal, capacity, &c, &missed,
+                                    )
+                                },
+                            )
+                            .await;
+                            match result {
+                                Ok((_, guard)) => drop(guard),
+                                Err(_) => {
+                                    c.rejects.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    }),
+                };
+                print_row("pair", shape, policy_name, n, &row, &counters);
+            }
+        }
+    }
+}
+
 fn main() {
     let fleets: Vec<usize> = env_list("PD_FLEETS", "8,64,512")
         .iter()
         .map(|s| s.parse().unwrap())
         .collect();
-    let sections = env_list("PD_SECTIONS", "fifo,window");
+    let sections = env_list("PD_SECTIONS", "fifo,window,rooms,pair");
     let names = env_list("PD_POLICIES", "round_robin,least_load");
     let tasks: usize = env_num("PD_TASKS", 64);
     let per_task: usize = env_num("PD_PER_TASK", 2_000);
     let window: usize = env_num("PD_WINDOW", 4_096);
     let binding: usize = env_num("PD_WINDOW_BINDING", 1);
+    let rooms: usize = env_num("PD_ROOMS", 4);
     println!("section\tshape\tpolicy\tworkers\tp50_ns\tp99_ns\tper_s\tmisses\trejects");
     for section in &sections {
         match section.as_str() {
             "fifo" => section_prefill("fifo", &fleets, tasks, per_task, window, &names),
             "window" => section_prefill("window", &fleets, tasks, per_task, binding, &names),
+            "rooms" => section_rooms(&fleets, tasks, per_task, rooms, &names),
+            "pair" => section_pair(&fleets, tasks, per_task, window, &names),
             other => eprintln!("unknown section {other}"),
         }
     }
