@@ -27,10 +27,11 @@ use serde::{
 };
 
 use crate::{
+    affinity::{Gates, KvPressure, PrefixAffinity, WarmupSlice},
     builtins::{
         Best, CountFirst, HasCapacity, HasRoom, Healthy, LeastLoad, LeastRequests, NotOverloaded,
-        NotTried, Passthrough, PowerOfTwo, PowerOfTwoCountFirst, PrefixAffinity, Random,
-        RoundRobin, SessionAffinity,
+        NotTried, Passthrough, PowerOfTwo, PowerOfTwoCountFirst, Random, RoundRobin,
+        SessionAffinity,
     },
     framework::{Binding, Engine, Filter, Picker, Plan, Profile, Scorer, Weighted},
     view::Phase,
@@ -384,20 +385,9 @@ impl Default for PrefixAffinityParams {
     }
 }
 
-impl PrefixAffinityParams {
-    /// Whether any parameter beyond the weight is written.
-    fn has_parameters(&self) -> bool {
-        self.threshold.is_some()
-            || self.decay.is_some()
-            || self.source.is_some()
-            || self.accounting_ttl_ms.is_some()
-            || self.spill.is_some()
-    }
-}
-
-/// The KV-pressure scorer: the fleet's KV-usage spread past which affinity
-/// yields to load, and the per-candidate ceiling above which the hottest
-/// candidate is de-ranked.
+/// The KV-pressure gate: the fleet's KV-usage spread, or the usage the
+/// hottest candidate crosses, past which the profile's affinity stages
+/// yield to load. The stage orders nothing itself.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct KvPressureParams {
@@ -410,8 +400,8 @@ pub struct KvPressureParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("exclusiveMinimum" = 0))]
     pub spread: Option<f32>,
-    /// The usage ceiling above which a candidate is de-ranked; above zero,
-    /// 1 and above switches the rule off (default 1).
+    /// The usage the hottest candidate crosses for affinity to yield to
+    /// load; above zero, 1 and above switches the rule off (default 1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("exclusiveMinimum" = 0))]
     pub ceiling: Option<f32>,
@@ -458,6 +448,12 @@ pub struct WarmupSliceParams {
     /// diversion off (default 8).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub divert_every: Option<u64>,
+    /// The index overlap share at or under which a hit counts as a miss
+    /// for the slice; between 0 and 1 (default 0.3, the affinity
+    /// threshold's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0.0, max = 1.0))]
+    pub miss_share: Option<f32>,
 }
 
 impl Default for WarmupSliceParams {
@@ -469,6 +465,7 @@ impl Default for WarmupSliceParams {
             blocks: None,
             thin_ratio: None,
             divert_every: None,
+            miss_share: None,
         }
     }
 }
@@ -1590,7 +1587,8 @@ fn check_stage(stage: &ScoreStage, at: &At) -> Result<(), SpecError> {
         }
         ScoreStage::WarmupSlice(p) => {
             at.number("share", p.share, unit_interval, "between 0 and 1")?;
-            at.number("thin_ratio", p.thin_ratio, unit_interval, "between 0 and 1")
+            at.number("thin_ratio", p.thin_ratio, unit_interval, "between 0 and 1")?;
+            at.number("miss_share", p.miss_share, unit_interval, "between 0 and 1")
         }
         ScoreStage::Bucket(p) => {
             at.number(
@@ -1641,7 +1639,23 @@ fn built_scorer(scorer: impl Scorer + 'static) -> Resolved<Box<dyn Scorer>> {
     Resolved::Built(Box::new(scorer))
 }
 
-fn scorer_of(stage: &ScoreStage) -> Resolved<Box<dyn Scorer>> {
+/// The gates a profile's affinity stages share: the spill gate of its
+/// `prefix-affinity` entry, the fleet gate of its `kv-pressure` entry and
+/// the view's block size.
+fn gates_of(p: &ProfileSpec, view: &ViewSpec) -> Gates {
+    let mut affinity = None;
+    let mut kv = None;
+    for entry in &p.score {
+        match entry {
+            ScoreSpec::Params(ScoreStage::PrefixAffinity(params)) => affinity = Some(params),
+            ScoreSpec::Params(ScoreStage::KvPressure(params)) => kv = Some(params),
+            _ => {}
+        }
+    }
+    Gates::of(affinity, kv, view.block_size)
+}
+
+fn scorer_of(stage: &ScoreStage, gates: Gates) -> Resolved<Box<dyn Scorer>> {
     match stage {
         ScoreStage::LeastLoad(p) => built_scorer(LeastLoad::new(
             p.kv_pressure_weight.unwrap_or(0.15),
@@ -1650,12 +1664,22 @@ fn scorer_of(stage: &ScoreStage) -> Resolved<Box<dyn Scorer>> {
         )),
         ScoreStage::LeastRequests(_) => built_scorer(LeastRequests),
         ScoreStage::SessionAffinity(_) => built_scorer(SessionAffinity),
-        ScoreStage::PrefixAffinity(p) if p.has_parameters() => {
-            Resolved::NotInBuild("the prefix-affinity parameters")
+        ScoreStage::PrefixAffinity(p) if p.decay.is_some_and(|decay| decay > 0.0) => {
+            Resolved::NotInBuild("the prefix-affinity decay")
         }
-        ScoreStage::PrefixAffinity(_) => built_scorer(PrefixAffinity),
-        ScoreStage::KvPressure(_) => Resolved::NotInBuild("the kv-pressure scorer"),
-        ScoreStage::WarmupSlice(_) => Resolved::NotInBuild("the warmup-slice scorer"),
+        ScoreStage::PrefixAffinity(p) if p.accounting_ttl_ms.is_some_and(|ttl| ttl > 0) => {
+            Resolved::NotInBuild("the prefix-affinity accounting")
+        }
+        ScoreStage::PrefixAffinity(p)
+            if p.spill
+                .as_ref()
+                .is_some_and(|spill| spill.uncached_credit == Some(true)) =>
+        {
+            Resolved::NotInBuild("the prefix-affinity uncached credit")
+        }
+        ScoreStage::PrefixAffinity(p) => built_scorer(PrefixAffinity::new(p, gates)),
+        ScoreStage::KvPressure(_) => built_scorer(KvPressure),
+        ScoreStage::WarmupSlice(p) => built_scorer(WarmupSlice::new(p, gates)),
         ScoreStage::Bucket(_) => Resolved::NotInBuild("the bucket scorer"),
         ScoreStage::ConsistentHash(_) => Resolved::NotInBuild("the consistent-hash scorer"),
         ScoreStage::ResidentWork(_) => Resolved::NotInBuild("the resident-work scorer"),
@@ -1742,9 +1766,11 @@ fn stage_of(entry: &ScoreSpec, profile: &str, at: &At) -> Result<ScoreStage, Spe
 fn check_profile(
     name: &str,
     p: &ProfileSpec,
+    view: &ViewSpec,
     needs: &mut Needs,
     deferred: &mut Deferred,
 ) -> Result<Option<Profile>, SpecError> {
+    let gates = gates_of(p, view);
     let at = At::new(format!("profiles.{name}"));
     let mut filters = Vec::with_capacity(p.filter.len());
     for f in &p.filter {
@@ -1760,7 +1786,7 @@ fn check_profile(
         let stage = stage_of(entry, name, &entry_at)?;
         let stage_at = entry_at.sub(stage.name());
         check_stage(&stage, &stage_at)?;
-        match scorer_of(&stage) {
+        match scorer_of(&stage, gates) {
             Resolved::Built(scorer) => {
                 *needs = needs.or(scorer.needs());
                 scorers.push(Weighted {
@@ -2103,12 +2129,13 @@ fn check_binding(
 
 /// The ten preset names of today, as whole profiles. The ones whose stages
 /// this build does not carry yet answer `UnknownPreset`.
-pub const PRESETS: [&str; 5] = [
+pub const PRESETS: [&str; 6] = [
     "random",
     "round_robin",
     "passthrough",
     "power_of_two",
     "least_load",
+    "cache_aware",
 ];
 
 fn standard_filters() -> Vec<String> {
@@ -2147,6 +2174,29 @@ impl PolicySpec {
             "least_load" => ProfileSpec {
                 filter: standard_filters(),
                 score: vec!["least-load".into()],
+                pick: "best".into(),
+            },
+            // Affinity first, the expected wait within the group: the slice
+            // and the diversion over everything when due, the holder tiers
+            // over the load, the fleet gate configuring both. The weights
+            // are ranks: each stage's values are 0, 0.5 or 1, so a stage
+            // outweighs everything after it.
+            "cache_aware" => ProfileSpec {
+                filter: standard_filters(),
+                score: vec![
+                    ScoreStage::WarmupSlice(WarmupSliceParams {
+                        weight: 8.0,
+                        ..WarmupSliceParams::default()
+                    })
+                    .into(),
+                    ScoreStage::PrefixAffinity(PrefixAffinityParams {
+                        weight: 4.0,
+                        ..PrefixAffinityParams::default()
+                    })
+                    .into(),
+                    "kv-pressure".into(),
+                    "least-load".into(),
+                ],
                 pick: "best".into(),
             },
             other => return Err(SpecError::UnknownPreset(other.to_string())),
@@ -2235,7 +2285,9 @@ impl PolicySpec {
         let mut needs = Needs::default();
         let mut profiles = Vec::with_capacity(self.profiles.len());
         for (name, profile) in &self.profiles {
-            if let Some(built) = check_profile(name, profile, &mut needs, &mut deferred)? {
+            if let Some(built) =
+                check_profile(name, profile, &self.view, &mut needs, &mut deferred)?
+            {
                 profiles.push(built);
             }
         }
@@ -2384,14 +2436,14 @@ mod tests {
         for name in PRESETS {
             let spec = PolicySpec::preset(name).expect(name);
             let engine = spec.validate().expect(name);
-            let load_aware = name == "least_load" || name == "power_of_two";
+            let load_aware = ["least_load", "power_of_two", "cache_aware"].contains(&name);
             assert_eq!(engine.needs().loads, load_aware, "{name}");
-            assert!(!engine.needs().events, "{name}");
+            assert_eq!(engine.needs().events, name == "cache_aware", "{name}");
             assert!(engine.profile_for("any", Phase::Single).is_some(), "{name}");
         }
         assert_eq!(
-            PolicySpec::preset("cache_aware").err(),
-            Some(SpecError::UnknownPreset("cache_aware".into()))
+            PolicySpec::preset("bucket").err(),
+            Some(SpecError::UnknownPreset("bucket".into()))
         );
     }
 
@@ -2894,6 +2946,8 @@ mod tests {
             "least-requests",
             "session-affinity",
             "prefix-affinity",
+            "kv-pressure",
+            "warmup-slice",
         ];
         for name in SCORERS {
             let bare = spec_with_score(&format!("{name:?}"));
@@ -2909,12 +2963,25 @@ mod tests {
                 );
             }
         }
+        // The affinity stages build with their parameters; the forms a later
+        // step carries are refused by name.
+        for score in [
+            r#"{"kv-pressure":{"spread":0.3,"ceiling":0.9}}"#,
+            r#"{"warmup-slice":{"secs":0,"miss_share":0.5}}"#,
+            r#"{"prefix-affinity":{"threshold":0.5,"source":"merged","spill":{"abs":8,"rel":2.0}}}"#,
+        ] {
+            assert!(spec_with_score(score).validate().is_ok(), "{score}");
+        }
         let with_params = [
+            (r#"{"prefix-affinity":{"decay":0.9}}"#, "prefix-affinity"),
             (
-                r#"{"kv-pressure":{"spread":0.3,"ceiling":0.9}}"#,
-                "kv-pressure",
+                r#"{"prefix-affinity":{"accounting_ttl_ms":200}}"#,
+                "prefix-affinity",
             ),
-            (r#"{"warmup-slice":{"secs":0}}"#, "warmup-slice"),
+            (
+                r#"{"prefix-affinity":{"spill":{"uncached_credit":true}}}"#,
+                "prefix-affinity",
+            ),
             (r#"{"bucket":{"abs_threshold":32}}"#, "bucket"),
             (
                 r#"{"consistent-hash":{"prefix_tokens":512,"bounded_load":{"factor":1.5,"abs_margin":4}}}"#,
@@ -2923,10 +2990,6 @@ mod tests {
             (
                 r#"{"resident-work":{"request_tokens":512}}"#,
                 "resident-work",
-            ),
-            (
-                r#"{"prefix-affinity":{"threshold":0.5}}"#,
-                "prefix-affinity",
             ),
         ];
         for (score, name) in with_params {
@@ -3303,7 +3366,7 @@ mod tests {
             not_in_build(&spec),
             (
                 "profiles.cache_aware.score[0].prefix-affinity".to_string(),
-                "the prefix-affinity parameters"
+                "the prefix-affinity decay"
             )
         );
         let yaml = serde_yaml::to_string(&spec).expect("yaml");
