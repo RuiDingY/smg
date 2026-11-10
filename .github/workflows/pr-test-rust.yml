@@ -1058,6 +1058,7 @@ jobs:
               ("scripts/ci_node_health.py",                      NONE),
               ("scripts/ci_prune_tokenspeed_images.sh",          NONE),
               ("scripts/ci_setup_sglang_rocm_image.sh",          SGLANG),
+              ("scripts/ci_verify_sglang_rocm_cohort.py",          SGLANG),
               ("scripts/ci_setup_vllm_rocm_image.sh",             VLLM + " embeddings"),
               ("scripts/ci_*",                                   FULL),
               ("scripts/**",                                     NONE),
@@ -2148,6 +2149,8 @@ jobs:
     timeout-minutes: ${{ matrix.timeout }}
     env:
       E2E_VENDOR: ${{ matrix.vendor }}
+      # Pod-local sidecar owns the real keys. Never map provider secrets here.
+      E2E_AI_KEY_PROXY: http://127.0.0.1:8787
       E2E_GPU_TIER: "0"
       SHOW_ROUTER_LOGS: "1"
     steps:
@@ -2381,7 +2384,7 @@ jobs:
           command -v gcc
           test -s bindings/golang/target/release/libsmg_go.so
       - name: Download Go SDK model
-        run: hf download meta-llama/Llama-3.2-1B-Instruct --quiet
+        run: bash scripts/ci_download_model.sh meta-llama/Llama-3.2-1B-Instruct
       - name: Run original Go OAI server assertions
         timeout-minutes: 45
         run: |
