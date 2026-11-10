@@ -181,6 +181,12 @@ impl LoadRow {
     pub fn kv_usage(&self) -> f32 {
         f32::from(self.kv_usage_permille) / 1000.0
     }
+
+    /// The share of the KV cache the running requests hold, as a ratio
+    /// `0.0` to `1.0`: the pressure the load stages read.
+    pub fn active_kv(&self) -> f32 {
+        f32::from(self.active_kv_permille) / 1000.0
+    }
 }
 
 /// A tenant or a session key as the view carries it: its fingerprint, and the
