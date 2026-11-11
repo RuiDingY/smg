@@ -168,12 +168,14 @@ fn filter(
         candidates,
         class,
         partnered,
+        encode,
     } = set;
     kept.clear();
     kept.extend((0..candidates.len() as u32).filter(|&i| {
         let c = &candidates[i as usize];
         class.is_none_or(|k| c.pair_class == k)
             && partnered.is_none_or(|p| p.binary_search(&c.pair_class).is_ok())
+            && (!encode || encode_fits(facts, c))
             && profile
                 .filters
                 .iter()
@@ -196,10 +198,11 @@ fn filter(
 
 /// The hard filter that left nothing (design 4.2: a shed names the stage that
 /// emptied the pool). The stages run again in profile order over the pool
-/// (the pair class, then the partnered test, then the hard filters) and the
-/// first after which no row survives is named; the pool is empty at this
-/// point, so the second walk costs a pick nothing. A pool with no candidate
-/// was emptied by no stage, a class with no decode by the partners.
+/// (the pair class, then the partnered test, then the `epd` plan's
+/// compatibility and vision rules, then the hard filters) and the first after
+/// which no row survives is named; the pool is empty at this point, so the
+/// second walk costs a pick nothing. A pool with no candidate was emptied by
+/// no stage, a class with no decode by the partners.
 fn emptied_by(
     profile: &Profile,
     facts: &RequestFacts<'_>,
@@ -211,6 +214,7 @@ fn emptied_by(
         candidates,
         class,
         partnered,
+        encode,
     } = set;
     kept.clear();
     kept.extend(
@@ -224,6 +228,16 @@ fn emptied_by(
         kept.retain(|&i| p.binary_search(&candidates[i as usize].pair_class).is_ok());
         if kept.is_empty() {
             return "partnered";
+        }
+    }
+    if encode {
+        kept.retain(|&i| candidates[i as usize].ec_compatible);
+        if kept.is_empty() {
+            return "ec-compatible";
+        }
+        kept.retain(|&i| vision_fits(facts, &candidates[i as usize]));
+        if kept.is_empty() {
+            return "vision";
         }
     }
     for hard in profile.filters.iter().filter(|f| !f.soft()) {
@@ -301,6 +315,22 @@ struct Set<'a> {
     candidates: &'a [Candidate],
     class: Option<u32>,
     partnered: Option<&'a [u32]>,
+    /// The `epd` plan's filters apply: the pool is the encode pool and the
+    /// rows' compatibility and vision bits are read.
+    encode: bool,
+}
+
+/// The `epd` plan's vision rule: a request carrying images takes an encoder
+/// with a vision encoder; a request without them takes any.
+fn vision_fits(facts: &RequestFacts<'_>, c: &Candidate) -> bool {
+    facts.media.images == 0 || c.vision
+}
+
+/// The `epd` plan's filters over the encode pool (design 4.4), read from the
+/// view's bits the host fills: the encoder is compatible with the pair's
+/// prefill side, and it takes the request's images.
+fn encode_fits(facts: &RequestFacts<'_>, c: &Candidate) -> bool {
+    c.ec_compatible && vision_fits(facts, c)
 }
 
 /// One profile over one pool: the filters, the scorers, the picker and the
@@ -366,6 +396,7 @@ impl Profile {
                 candidates,
                 class: None,
                 partnered: None,
+                encode: false,
             },
             cx,
             &mut scratch.single,
@@ -382,6 +413,34 @@ pub enum Plan {
     /// The prefill profile over the open prefills, then the decode profile
     /// over the chosen prefill's partners.
     PdPair,
+    /// The encode profile named here, once per encode item over the encode
+    /// pool with the pair's EC compatibility and the request's vision demand
+    /// as the plan's own filters, then the pair as under `PdPair`: the
+    /// binding's `profile` is the prefill side and `decode_profile` the
+    /// decode side. The encode side rides the plan, so a binding keeps the
+    /// pair's two fields.
+    Epd {
+        /// The encode profile, by position.
+        encode: u16,
+    },
+}
+
+/// The profile a binding resolves a phase to, by position; `None` when the
+/// binding's plan has no side for the phase: a single or an encode request
+/// under the pair plan, a single request under `epd`. The host and the spec
+/// disagree there, and the decision is declined by the binding, as a pair
+/// decision under a single binding is.
+fn profile_index(binding: &Binding, phase: Phase) -> Option<u16> {
+    match (binding.plan, phase) {
+        (Plan::Single, _) | (Plan::PdPair | Plan::Epd { .. }, Phase::Prefill) => {
+            Some(binding.profile)
+        }
+        (Plan::PdPair | Plan::Epd { .. }, Phase::Decode) => {
+            Some(binding.decode_profile.unwrap_or(binding.profile))
+        }
+        (Plan::Epd { encode }, Phase::Encode) => Some(encode),
+        (Plan::PdPair, Phase::Single | Phase::Encode) | (Plan::Epd { .. }, Phase::Single) => None,
+    }
 }
 
 /// A binding: which profile (or plan of profiles) a request resolves to.
@@ -460,17 +519,16 @@ impl Engine {
         self.bindings.iter().find(|b| b.matches(model, phase))
     }
 
-    /// The profile a request resolves to for its phase.
+    /// The profile a request resolves to for its phase; `None` when no
+    /// binding matches or the binding's plan has no side for the phase.
     pub fn profile_for(&self, model: &str, phase: Phase) -> Option<(u16, &Profile)> {
-        let binding = self.binding(model, phase)?;
-        let index = match (binding.plan, phase) {
-            (Plan::PdPair, Phase::Decode) => binding.decode_profile.unwrap_or(binding.profile),
-            _ => binding.profile,
-        };
+        let index = profile_index(self.binding(model, phase)?, phase)?;
         self.profiles.get(usize::from(index)).map(|p| (index, p))
     }
 
-    /// The `single` plan: one profile over `candidates`.
+    /// One profile over `candidates`: the `single` plan, or one encode item
+    /// of the `epd` plan (the request's phase is `Encode` and the plan's
+    /// compatibility and vision rules filter the pool before the profile).
     pub fn decide(
         &self,
         facts: &RequestFacts<'_>,
@@ -479,7 +537,16 @@ impl Engine {
         cx: &Constraints<'_>,
         scratch: &mut Scratch,
     ) -> Decision {
-        let Some((index, profile)) = self.profile_for(facts.model, facts.phase) else {
+        let resolved = self.binding(facts.model, facts.phase).and_then(|binding| {
+            let index = profile_index(binding, facts.phase)?;
+            let profile = self.profiles.get(usize::from(index))?;
+            let encode = matches!(
+                (binding.plan, facts.phase),
+                (Plan::Epd { .. }, Phase::Encode)
+            );
+            Some((index, profile, encode))
+        });
+        let Some((index, profile, encode)) = resolved else {
             return shed(
                 ShedReason::PolicyDeclined,
                 "binding",
@@ -490,11 +557,25 @@ impl Engine {
                 },
             );
         };
-        profile.decide(index, facts, pool, candidates, cx, scratch)
+        run_profile(
+            profile,
+            index,
+            facts,
+            pool,
+            Set {
+                candidates,
+                class: None,
+                partnered: None,
+                encode,
+            },
+            cx,
+            &mut scratch.single,
+        )
     }
 
-    /// The `pd-pair` plan: the prefill profile over `prefills`, then the
-    /// decode profile over the decodes of the chosen prefill's pair class. A
+    /// The `pd-pair` plan, and the pair half of `epd`: the prefill profile
+    /// over `prefills`, then the decode profile over the decodes of the
+    /// chosen prefill's pair class. A
     /// prefill whose partners leave no decode is passed over for the next
     /// prefill target; the targets list carries the chosen pair first and the
     /// alternate decodes of the same prefill after it. Pair class `0` is
@@ -521,7 +602,7 @@ impl Engine {
         // declines a pair decision: the host and the spec disagree.
         let Some(binding) = self
             .binding(facts.model, Phase::Prefill)
-            .filter(|b| b.plan == Plan::PdPair)
+            .filter(|b| matches!(b.plan, Plan::PdPair | Plan::Epd { .. }))
         else {
             return shed(ShedReason::PolicyDeclined, "binding", bare);
         };
@@ -575,6 +656,7 @@ impl Engine {
                 candidates: prefills,
                 class: None,
                 partnered: Some(&scratch.classes),
+                encode: false,
             },
             cx,
             &mut scratch.single,
@@ -616,6 +698,7 @@ impl Engine {
                                 candidates: prefills,
                                 class: None,
                                 partnered: None,
+                                encode: false,
                             },
                         );
                         return shed(reason_of(stage), stage, prefill_shed.trace);
@@ -632,6 +715,7 @@ impl Engine {
                             candidates: decodes,
                             class: None,
                             partnered: Some(&scratch.classes),
+                            encode: false,
                         },
                     );
                     if stage != "none" {
@@ -663,6 +747,7 @@ impl Engine {
                     candidates: decodes,
                     class: Some(class),
                     partnered: None,
+                    encode: false,
                 },
                 decode_cx,
                 &mut scratch.decode,
@@ -776,6 +861,7 @@ mod tests {
         Candidate {
             position,
             id: WorkerId(100 + u64::from(position)),
+            key: 100 + position,
             health: Health {
                 healthy: true,
                 ..Health::default()
@@ -1701,5 +1787,181 @@ mod tests {
         assert!(scores
             .iter()
             .all(|&s| (s - (0.75 * 0.5 + 0.25)).abs() < 1e-6));
+    }
+
+    fn encode_candidate(position: u32, ec_compatible: bool, vision: bool) -> Candidate {
+        Candidate {
+            role: crate::view::Role::Encode,
+            ec_compatible,
+            vision,
+            ..candidate(position, 0)
+        }
+    }
+
+    /// Profile 0 is the strict pair side, profile 1 the encode profile.
+    fn epd_engine() -> Engine {
+        Engine::new(
+            vec![strict_profile(), least_requests_profile()],
+            vec![Binding {
+                model: "*".into(),
+                phases: vec![],
+                plan: Plan::Epd { encode: 1 },
+                profile: 0,
+                decode_profile: Some(0),
+            }],
+            1,
+            Needs::default(),
+        )
+    }
+
+    fn encode_facts(images: u16) -> RequestFacts<'static> {
+        RequestFacts {
+            model: "m",
+            phase: Phase::Encode,
+            media: crate::view::MediaCounts {
+                images,
+                ..crate::view::MediaCounts::default()
+            },
+            ..RequestFacts::default()
+        }
+    }
+
+    /// A single or an encode request under the pair plan, and a single one
+    /// under `epd`, resolve to no profile and are declined by the binding,
+    /// as a pair decision under a single binding is; the pair phases and
+    /// `epd`'s encode phase resolve to their sides.
+    #[test]
+    fn a_single_or_encode_request_under_the_pair_plan_is_declined_by_the_binding() {
+        let pair = Engine::new(
+            vec![strict_profile()],
+            vec![pair_binding()],
+            1,
+            Needs::default(),
+        );
+        for phase in [Phase::Single, Phase::Encode] {
+            assert!(pair.profile_for("m", phase).is_none(), "{phase:?}");
+            let facts = RequestFacts {
+                model: "m",
+                phase,
+                ..RequestFacts::default()
+            };
+            let mut scratch = Scratch::new();
+            match pair.decide(
+                &facts,
+                &PoolFacts::default(),
+                &[candidate(0, 0)],
+                &Constraints::default(),
+                &mut scratch,
+            ) {
+                Decision::Shed(shed) => {
+                    assert_eq!(shed.reason, ShedReason::PolicyDeclined, "{phase:?}");
+                    assert_eq!(shed.emptied_by, "binding", "{phase:?}");
+                }
+                other => panic!("{phase:?} under the pair plan answered {other:?}"),
+            }
+        }
+        assert!(pair.profile_for("m", Phase::Prefill).is_some());
+        assert!(pair.profile_for("m", Phase::Decode).is_some());
+        let epd = epd_engine();
+        assert!(epd.profile_for("m", Phase::Single).is_none());
+        let side = |phase: Phase| {
+            epd.profile_for("m", phase)
+                .map(|(i, p)| (i, p.name.clone()))
+        };
+        assert_eq!(side(Phase::Encode), Some((1, "least".to_string())));
+        assert_eq!(side(Phase::Prefill), Some((0, "strict".to_string())));
+        assert_eq!(side(Phase::Decode), Some((0, "strict".to_string())));
+    }
+
+    /// The `epd` plan reads the rows' compatibility and vision bits before
+    /// the encode profile's own stages, and a pool they empty names them; a
+    /// single-plan binding never reads the bits.
+    #[test]
+    fn the_epd_plan_filters_encoders_by_ec_compatibility_and_vision_and_names_the_stage() {
+        let epd = epd_engine();
+        let decide = |facts: &RequestFacts<'_>, pool: &[Candidate]| {
+            let mut scratch = Scratch::new();
+            epd.decide(
+                facts,
+                &PoolFacts::default(),
+                pool,
+                &Constraints::default(),
+                &mut scratch,
+            )
+        };
+        let pool = [
+            encode_candidate(0, false, true),
+            encode_candidate(1, true, true),
+            encode_candidate(2, true, false),
+        ];
+        let text = decide(&encode_facts(0), &pool);
+        let pick = text.pick().expect("a pick");
+        assert!(pick.targets.iter().all(|t| t.position != 0), "{pick:?}");
+        assert_eq!(pick.trace.survivors, 2, "the incompatible encoder is out");
+        let image = decide(&encode_facts(1), &pool);
+        let pick = image.pick().expect("a pick");
+        let order: Vec<u32> = pick.targets.iter().map(|t| t.position).collect();
+        assert_eq!(order, [1], "an image takes the vision encoder alone");
+        let shed_of = |facts: &RequestFacts<'_>, pool: &[Candidate]| match decide(facts, pool) {
+            Decision::Shed(shed) => (shed.emptied_by, shed.reason),
+            other => panic!("an emptied pool answered {other:?}"),
+        };
+        assert_eq!(
+            shed_of(&encode_facts(0), &[encode_candidate(0, false, true)]),
+            ("ec-compatible", ShedReason::NoEndpoints)
+        );
+        assert_eq!(
+            shed_of(&encode_facts(1), &[encode_candidate(0, true, false)]),
+            ("vision", ShedReason::NoEndpoints)
+        );
+        assert!(
+            decide(&encode_facts(0), &[encode_candidate(0, true, false)])
+                .pick()
+                .is_some(),
+            "a request without images takes an encoder without a vision encoder"
+        );
+        let mut sick = encode_candidate(0, true, true);
+        sick.health.healthy = false;
+        assert_eq!(
+            shed_of(&encode_facts(0), &[sick, encode_candidate(1, false, true)]).0,
+            "healthy",
+            "the profile's stage is named after the plan's"
+        );
+        let single = engine();
+        let mut scratch = Scratch::new();
+        let regular = [encode_candidate(0, false, false)];
+        assert!(
+            single
+                .decide(
+                    &encode_facts(1),
+                    &PoolFacts::default(),
+                    &regular,
+                    &Constraints::default(),
+                    &mut scratch,
+                )
+                .pick()
+                .is_some(),
+            "a single-plan binding reads no compatibility bit"
+        );
+    }
+
+    #[test]
+    fn the_epd_binding_serves_its_pair_half_through_decide_pair() {
+        let epd = epd_engine();
+        let mut prefills = [candidate(0, 0)];
+        prefills[0].pair_class = 7;
+        let mut decodes = [candidate(0, 0)];
+        decodes[0].pair_class = 7;
+        let decision = decide_pair(&epd, &prefills, &decodes);
+        let pick = decision
+            .pick()
+            .expect("the epd binding's pair half decides");
+        assert_eq!(
+            pick.targets
+                .first()
+                .and_then(|t| t.pair)
+                .map(|p| p.decode_position),
+            Some(0)
+        );
     }
 }
